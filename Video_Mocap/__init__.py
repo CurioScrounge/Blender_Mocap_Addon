@@ -1,12 +1,12 @@
 # ─────────────────────────────────────────────────────────────────
 # video_mocap/__init__.py
-# Native Blender Video Motion Capture Add-on — v2.5
+# Native Blender Video Motion Capture Add-on — v2.6
 # ─────────────────────────────────────────────────────────────────
 
 bl_info = {
     "name": "Video Motion Capture",
     "author": "Your Name",
-    "version": (2, 5, 0),
+    "version": (2, 6, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > VMoCap",
     "description": "Video-based motion capture with automatic and guided tracking",
@@ -24,6 +24,8 @@ import subprocess
 import urllib.request
 import time
 import re
+import threading
+from collections import deque
 from pathlib import Path
 from mathutils import Vector, Matrix, Quaternion, Euler
 from bpy.props import (
@@ -172,6 +174,25 @@ LANDMARK_DIRECTION_PAIRS = {
     "spine_direction": (23, 11),
 }
 
+# Which MediaPipe landmark indices are required to be visible
+# for each bone direction to be considered reliable
+LANDMARK_VISIBILITY_REQUIREMENTS = {
+    "left_shoulder": [11, 13],
+    "right_shoulder": [12, 14],
+    "left_elbow": [13, 15],
+    "right_elbow": [14, 16],
+    "left_wrist": [15, 19],
+    "right_wrist": [16, 20],
+    "left_hip": [23, 25],
+    "right_hip": [24, 26],
+    "left_knee": [25, 27],
+    "right_knee": [26, 28],
+    "left_ankle": [27, 31],
+    "right_ankle": [28, 32],
+    "nose": [0, 11, 12],
+    "spine_direction": [11, 12, 23, 24],
+}
+
 BONE_MAP_PRESETS = {
     'RIGIFY': {
         "spine_direction": "spine",
@@ -266,22 +287,7 @@ FACE_ACTION_UNITS = {
     "smile_R": {"landmarks": [291, 278], "reference": [152, 10], "method": "distance_ratio"},
 }
 
-# ═════════════════════════════════════════════════════════════════
-# ARKit → Shape Key Mapping
-#
-# This map now includes CC4/iClone ActorCore naming conventions
-# (Brow_Down_L, Eye_Squint_Inner_L, Mouth_Smile_L, etc.)
-# alongside standard CC3 export names.
-#
-# Each ARKit blendshape maps to a list of candidate shape key names.
-# The first match found on the mesh wins.
-# For "split" blendshapes (one ARKit name drives both L+R),
-# we list them as separate L/R entries — handled by the
-# apply_blendshapes_direct method.
-# ═════════════════════════════════════════════════════════════════
-
 ARKIT_TO_CC3_MAP = {
-    # ─── Brows ───
     "browDownLeft": [
         "Brow_Down_L", "Brow_Drop_L", "BrowDrop_L", "brow_drop_l",
     ],
@@ -289,8 +295,6 @@ ARKIT_TO_CC3_MAP = {
         "Brow_Down_R", "Brow_Drop_R", "BrowDrop_R", "brow_drop_r",
     ],
     "browInnerUp": [
-        # This is a single ARKit shape that raises both inner brows.
-        # CC4 splits it into L and R — handled via ARKIT_SPLIT_MAP below.
         "Brow_Raise_Inner_L", "Brow_Raise_Inner_R",
         "Brow_Raise_In_L", "Brow_Raise_In_R",
         "BrowRaiseInner_L", "BrowRaiseInner_R",
@@ -302,7 +306,6 @@ ARKIT_TO_CC3_MAP = {
     "browOuterUpRight": [
         "Brow_Raise_Outer_R", "BrowRaiseOuter_R", "brow_raise_outer_r",
     ],
-    # ─── Eyes ───
     "eyeBlinkLeft": [
         "Eye_Blink_L", "EyeBlink_L", "eye_blink_l", "Blink_L",
     ],
@@ -345,7 +348,6 @@ ARKIT_TO_CC3_MAP = {
     "eyeWideRight": [
         "Eye_Wide_R", "Eye_Widen_R", "EyeWide_R", "eye_wide_r",
     ],
-    # ─── Jaw ───
     "jawForward": [
         "Jaw_Forward", "Jaw_Thrust", "JawForward", "jaw_forward",
     ],
@@ -358,7 +360,6 @@ ARKIT_TO_CC3_MAP = {
     "jawOpen": [
         "Jaw_Open", "JawOpen", "jaw_open", "V_Open", "Mouth_Open",
     ],
-    # ─── Mouth ───
     "mouthClose": [
         "Mouth_Close", "Mouth_Up", "MouthClose", "mouth_close",
     ],
@@ -438,7 +439,6 @@ ARKIT_TO_CC3_MAP = {
     "mouthUpperUpRight": [
         "Mouth_UpperLip_Raise_R", "Mouth_Up_Upper_R", "MouthUpperUp_R",
     ],
-    # ─── Cheeks ───
     "cheekPuff": [
         "Cheek_Puff_L", "Cheek_Puff_R", "Cheek_Blow_L", "Cheek_Blow_R",
         "CheekPuff", "cheek_puff",
@@ -449,7 +449,6 @@ ARKIT_TO_CC3_MAP = {
     "cheekSquintRight": [
         "Cheek_Raise_R", "CheekSquint_R", "cheek_squint_r",
     ],
-    # ─── Nose ───
     "noseSneerLeft": [
         "Nose_Sneer_L", "Nose_Scrunch_L", "Nose_Wrinkle_L",
         "NoseSneer_L", "nose_sneer_l",
@@ -458,15 +457,11 @@ ARKIT_TO_CC3_MAP = {
         "Nose_Sneer_R", "Nose_Scrunch_R", "Nose_Wrinkle_R",
         "NoseSneer_R", "nose_sneer_r",
     ],
-    # ─── Tongue ───
     "tongueOut": [
         "Tongue_Out", "TongueOut", "tongue_out",
     ],
 }
 
-# ARKit blendshapes that should drive BOTH L and R shape keys simultaneously.
-# Format: arkit_name → [(left_shape_key_candidates), (right_shape_key_candidates)]
-# If a blendshape is in this map AND in ARKIT_TO_CC3_MAP, this takes priority.
 ARKIT_SPLIT_MAP = {
     "browInnerUp": (
         ["Brow_Raise_In_L", "Brow_Raise_Inner_L", "BrowRaiseInner_L"],
@@ -600,6 +595,7 @@ class LandmarkDetector:
 
         output = {
             "pose": None,
+            "pose_visibility": None,
             "face": None,
             "face_blendshapes": None,
             "left_hand": None,
@@ -623,6 +619,11 @@ class LandmarkDetector:
                 if result.pose_world_landmarks and len(result.pose_world_landmarks) > 0:
                     lms = result.pose_world_landmarks[0]
                     output["pose"] = np.array([[lm.x, lm.y, lm.z] for lm in lms])
+                    # Capture visibility scores (0.0 to 1.0)
+                    output["pose_visibility"] = np.array([
+                        lm.visibility if hasattr(lm, 'visibility') else 1.0
+                        for lm in lms
+                    ])
             except Exception as e:
                 print(f"[VMoCap] Pose detection error: {e}")
 
@@ -655,8 +656,10 @@ class LandmarkDetector:
         if self._holistic_detector:
             results = self._holistic_detector.process(frame_rgb)
             if results.pose_world_landmarks:
-                output["pose"] = np.array([
-                    [lm.x, lm.y, lm.z] for lm in results.pose_world_landmarks.landmark
+                lms = results.pose_world_landmarks.landmark
+                output["pose"] = np.array([[lm.x, lm.y, lm.z] for lm in lms])
+                output["pose_visibility"] = np.array([
+                    lm.visibility for lm in lms
                 ])
             if results.face_landmarks:
                 output["face"] = np.array([
@@ -678,8 +681,10 @@ class LandmarkDetector:
         elif self._pose_detector:
             results = self._pose_detector.process(frame_rgb)
             if results.pose_world_landmarks:
-                output["pose"] = np.array([
-                    [lm.x, lm.y, lm.z] for lm in results.pose_world_landmarks.landmark
+                lms = results.pose_world_landmarks.landmark
+                output["pose"] = np.array([[lm.x, lm.y, lm.z] for lm in lms])
+                output["pose_visibility"] = np.array([
+                    lm.visibility for lm in lms
                 ])
 
     def close(self):
@@ -705,12 +710,18 @@ class CoordinateTransformer:
     """
 
     @staticmethod
-    def batch_transform(landmarks_array, scale=1.0, camera_angle_deg=0.0):
+    def batch_transform(landmarks_array, scale=1.0, camera_angle_deg=0.0,
+                        depth_influence=1.0):
+        """
+        Transform landmarks from MediaPipe space to Blender space.
+        depth_influence: 0.0 = ignore Z entirely, 1.0 = full Z.
+        """
         if landmarks_array is None:
             return None
         transformed = np.zeros_like(landmarks_array)
         transformed[:, 0] = landmarks_array[:, 0] * scale
-        transformed[:, 1] = -landmarks_array[:, 2] * scale
+        # Apply depth influence to dampen unreliable Z
+        transformed[:, 1] = -landmarks_array[:, 2] * scale * depth_influence
         transformed[:, 2] = -landmarks_array[:, 1] * scale
 
         if abs(camera_angle_deg) > 0.1:
@@ -730,15 +741,25 @@ class PoseRetargeter:
     Retargets detected pose landmarks to an armature.
     Processes bones in hierarchy order and properly accounts for
     parent rotations using the bone's basis matrix.
+
+    Now supports:
+    - Visibility-based filtering (skip unreliable landmarks)
+    - Hold-last-good-pose (when visibility drops, hold previous rotation)
+    - Depth damping (reduce Z influence for noisy depth)
     """
 
-    def __init__(self, armature_obj, bone_mapping, scale=1.0):
+    def __init__(self, armature_obj, bone_mapping, scale=1.0,
+                 visibility_threshold=0.5, hold_bad_frames=True):
         self.armature = armature_obj
         self.bone_map = bone_mapping
         self.scale = scale
+        self.visibility_threshold = visibility_threshold
+        self.hold_bad_frames = hold_bad_frames
         self._keyframed_count = 0
         self._warnings = set()
         self._sorted_mappings = None
+        self._last_good_rotations = {}  # bone_name -> Quaternion
+        self._skipped_frames = {}  # bone_name -> count of consecutive skips
         self._prepare_hierarchy()
 
     def _prepare_hierarchy(self):
@@ -759,6 +780,28 @@ class PoseRetargeter:
             depth += 1
             parent = parent.parent
         return depth
+
+    def _check_landmark_visibility(self, landmark_name, visibility_array):
+        """
+        Check if all required landmarks for a bone direction are visible.
+        Returns the minimum visibility score among required landmarks,
+        or 1.0 if no visibility data is available.
+        """
+        if visibility_array is None:
+            return 1.0
+
+        required_indices = LANDMARK_VISIBILITY_REQUIREMENTS.get(landmark_name)
+        if not required_indices:
+            return 1.0
+
+        min_vis = 1.0
+        for idx in required_indices:
+            if idx < len(visibility_array):
+                min_vis = min(min_vis, visibility_array[idx])
+            else:
+                min_vis = 0.0
+
+        return min_vis
 
     def _compute_basis_3x3(self, pose_bone, posed_matrices):
         bone = pose_bone.bone
@@ -797,7 +840,13 @@ class PoseRetargeter:
             return None
         return direction
 
-    def apply_pose_frame(self, landmarks_blender, frame):
+    def apply_pose_frame(self, landmarks_blender, frame,
+                         visibility_array=None, keyframe=True):
+        """
+        Apply pose for a single frame.
+        visibility_array: per-landmark visibility scores from MediaPipe.
+        keyframe: if False, just set the pose without inserting keyframes.
+        """
         if landmarks_blender is None:
             return
 
@@ -814,6 +863,36 @@ class PoseRetargeter:
                     print(f"[VMoCap] Bone '{bone_name}' not found on armature!")
                 continue
 
+            # ─── VISIBILITY CHECK ───
+            vis_score = self._check_landmark_visibility(
+                landmark_name, visibility_array
+            )
+
+            if vis_score < self.visibility_threshold:
+                # Landmark not reliably visible
+                if self.hold_bad_frames and bone_name in self._last_good_rotations:
+                    # Hold the last known good rotation
+                    local_rot = self._last_good_rotations[bone_name]
+                    pose_bone.rotation_mode = 'QUATERNION'
+                    pose_bone.rotation_quaternion = local_rot
+                    if keyframe:
+                        pose_bone.keyframe_insert(
+                            data_path="rotation_quaternion", frame=frame
+                        )
+                        self._keyframed_count += 1
+                    # Still update posed_matrices for children
+                    basis_3x3 = self._compute_basis_3x3(pose_bone, posed_matrices)
+                    posed_matrices[bone_name] = basis_3x3 @ local_rot.to_matrix()
+
+                self._skipped_frames[bone_name] = (
+                    self._skipped_frames.get(bone_name, 0) + 1
+                )
+                continue
+
+            # Reset skip counter
+            self._skipped_frames[bone_name] = 0
+
+            # ─── COMPUTE ROTATION ───
             target_dir = self._get_target_direction(landmark_name, landmarks_blender)
             if target_dir is None:
                 if landmark_name not in self._warnings:
@@ -829,10 +908,26 @@ class PoseRetargeter:
 
             local_rot = Vector((0, 1, 0)).rotation_difference(local_target)
 
+            # ─── BLEND WITH LAST GOOD IF VISIBILITY IS MARGINAL ───
+            # Smooth transition when visibility is between threshold and 0.8
+            if vis_score < 0.8 and bone_name in self._last_good_rotations:
+                blend_factor = (vis_score - self.visibility_threshold) / (
+                    0.8 - self.visibility_threshold
+                )
+                blend_factor = max(0.0, min(1.0, blend_factor))
+                last_rot = self._last_good_rotations[bone_name]
+                local_rot = last_rot.slerp(local_rot, blend_factor)
+
+            # Store as last good
+            self._last_good_rotations[bone_name] = local_rot.copy()
+
             pose_bone.rotation_mode = 'QUATERNION'
             pose_bone.rotation_quaternion = local_rot
-            pose_bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
-            self._keyframed_count += 1
+            if keyframe:
+                pose_bone.keyframe_insert(
+                    data_path="rotation_quaternion", frame=frame
+                )
+                self._keyframed_count += 1
 
             posed_matrices[bone_name] = basis_3x3 @ local_rot.to_matrix()
 
@@ -842,17 +937,15 @@ class PoseRetargeter:
     def get_warnings(self):
         return self._warnings
 
+    def get_skip_stats(self):
+        """Return how many frames were skipped per bone due to visibility."""
+        return dict(self._skipped_frames)
+
 
 class FaceRetargeter:
     """
     Retargets face data to shape keys on multiple mesh objects.
     Supports Tasks API blendshapes and legacy computed Action Units.
-
-    Key features:
-    - Strict side matching: Left ARKit shapes only match L shape keys.
-    - Split blendshapes: Some ARKit shapes (browInnerUp, cheekPuff) drive
-      both L and R shape keys simultaneously.
-    - Multi-strategy matching with side-awareness.
     """
 
     def __init__(self, mesh_objects):
@@ -870,7 +963,6 @@ class FaceRetargeter:
         self._build_shapekey_map()
 
     def _build_shapekey_map(self):
-        """Scan all mesh targets and catalog available shape keys."""
         self._shapekey_mesh_map = {}
         self._shapekey_names_lower = {}
         self._shapekey_names_normalized = {}
@@ -894,7 +986,6 @@ class FaceRetargeter:
                     self._shapekey_names_normalized[normalized] = kb.name
 
     def _normalize_name(self, name):
-        """Normalize for fuzzy matching: strip prefixes, remove separators, lowercase."""
         s = name
         s = re.sub(r'^[A-Z]\d{2}_', '', s)
         s = re.sub(r'^CC_Base_', '', s, flags=re.IGNORECASE)
@@ -903,15 +994,10 @@ class FaceRetargeter:
         return s
 
     def _get_arkit_side(self, arkit_name):
-        """
-        Determine which side an ARKit blendshape targets.
-        Returns 'L', 'R', or None (bilateral/center).
-        """
         if arkit_name.endswith("Left"):
             return 'L'
         if arkit_name.endswith("Right"):
             return 'R'
-        # Check for known single-side names
         if arkit_name.endswith("_L") or arkit_name.endswith(".L"):
             return 'L'
         if arkit_name.endswith("_R") or arkit_name.endswith(".R"):
@@ -919,24 +1005,15 @@ class FaceRetargeter:
         return None
 
     def _get_shapekey_side(self, sk_name):
-        """
-        Determine side of a shape key from its name.
-        Returns 'L', 'R', or None.
-        """
         lower = sk_name.lower()
-        # Check common suffixes
-        if lower.endswith('_l') or lower.endswith('.l') or lower.endswith('l') and (
-                len(lower) > 1 and lower[-2] in ('_', '.', ' ')):
+        if lower.endswith('_l') or lower.endswith('.l'):
             return 'L'
-        if lower.endswith('_r') or lower.endswith('.r') or lower.endswith('r') and (
-                len(lower) > 1 and lower[-2] in ('_', '.', ' ')):
+        if lower.endswith('_r') or lower.endswith('.r'):
             return 'R'
-        # Check for L/R anywhere with separators
         if re.search(r'[_.]l[_.]|[_.]l$|_l_|^l_', lower):
             return 'L'
         if re.search(r'[_.]r[_.]|[_.]r$|_r_|^r_', lower):
             return 'R'
-        # Check for "Left"/"Right" in name
         if 'left' in lower or '_l_' in lower:
             return 'L'
         if 'right' in lower or '_r_' in lower:
@@ -944,12 +1021,6 @@ class FaceRetargeter:
         return None
 
     def _sides_compatible(self, arkit_side, sk_side):
-        """
-        Check if an ARKit blendshape side is compatible with a shape key side.
-        - If ARKit is None (bilateral), it can match anything.
-        - If ARKit is L, it can only match L or None (non-sided).
-        - If ARKit is R, it can only match R or None (non-sided).
-        """
         if arkit_side is None:
             return True
         if sk_side is None:
@@ -957,10 +1028,6 @@ class FaceRetargeter:
         return arkit_side == sk_side
 
     def _find_matching_shapekey(self, arkit_name):
-        """
-        Find the best matching shape key for an ARKit blendshape name.
-        Enforces side-matching to prevent L shapes from matching R keys.
-        """
         if arkit_name in self._match_cache:
             return self._match_cache[arkit_name]
 
@@ -971,17 +1038,16 @@ class FaceRetargeter:
         if arkit_name in self._shapekey_mesh_map:
             matched = arkit_name
 
-        # Strategy 2: CC3/CC4 lookup table (explicit, already side-correct)
+        # Strategy 2: CC3/CC4 lookup table
         if not matched and arkit_name in ARKIT_TO_CC3_MAP:
             for candidate in ARKIT_TO_CC3_MAP[arkit_name]:
                 if candidate in self._shapekey_mesh_map:
-                    # Verify side compatibility
                     sk_side = self._get_shapekey_side(candidate)
                     if self._sides_compatible(arkit_side, sk_side):
                         matched = candidate
                         break
 
-        # Strategy 3: Generated variants (side-aware)
+        # Strategy 3: Generated variants
         if not matched:
             for variant in self._generate_variants(arkit_name):
                 if variant in self._shapekey_mesh_map:
@@ -999,7 +1065,7 @@ class FaceRetargeter:
                 if self._sides_compatible(arkit_side, sk_side):
                     matched = candidate
 
-        # Strategy 5: Case-insensitive CC3 table variants
+        # Strategy 5: Case-insensitive CC3 table
         if not matched and arkit_name in ARKIT_TO_CC3_MAP:
             for candidate in ARKIT_TO_CC3_MAP[arkit_name]:
                 cl = candidate.lower()
@@ -1010,7 +1076,7 @@ class FaceRetargeter:
                         matched = actual
                         break
 
-        # Strategy 6: Normalized fuzzy match (side-aware)
+        # Strategy 6: Normalized fuzzy match
         if not matched:
             normalized_arkit = self._normalize_name(arkit_name)
             if normalized_arkit in self._shapekey_names_normalized:
@@ -1019,7 +1085,7 @@ class FaceRetargeter:
                 if self._sides_compatible(arkit_side, sk_side):
                     matched = candidate
 
-        # Strategy 7: Normalized CC3 table variants
+        # Strategy 7: Normalized CC3 table
         if not matched and arkit_name in ARKIT_TO_CC3_MAP:
             for candidate in ARKIT_TO_CC3_MAP[arkit_name]:
                 norm_candidate = self._normalize_name(candidate)
@@ -1034,11 +1100,6 @@ class FaceRetargeter:
         return matched
 
     def _find_split_targets(self, arkit_name):
-        """
-        For bilateral ARKit shapes that should drive both L and R,
-        find both target shape keys.
-        Returns list of matched shape key names, or empty list.
-        """
         if arkit_name in self._split_cache:
             return self._split_cache[arkit_name]
 
@@ -1049,7 +1110,6 @@ class FaceRetargeter:
 
         left_candidates, right_candidates = ARKIT_SPLIT_MAP[arkit_name]
 
-        # Find left
         left_match = None
         for candidate in left_candidates:
             if candidate in self._shapekey_mesh_map:
@@ -1060,7 +1120,6 @@ class FaceRetargeter:
                 left_match = self._shapekey_names_lower[cl]
                 break
 
-        # Find right
         right_match = None
         for candidate in right_candidates:
             if candidate in self._shapekey_mesh_map:
@@ -1080,9 +1139,7 @@ class FaceRetargeter:
         return results
 
     def _generate_variants(self, name):
-        """Generate naming variants for an ARKit blendshape name."""
         variants = []
-
         snake = re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower()
         variants.append(snake)
 
@@ -1095,9 +1152,7 @@ class FaceRetargeter:
                 base_snake.lower() + "_l", base_snake.lower() + ".l",
             ])
             snake_base = snake[:-5] if snake.endswith("_left") else snake
-            variants.extend([
-                snake_base + "_l", snake_base + "_L",
-            ])
+            variants.extend([snake_base + "_l", snake_base + "_L"])
         elif name.endswith("Right"):
             base = name[:-5]
             base_snake = re.sub(r'(?<!^)(?=[A-Z])', '_', base)
@@ -1107,9 +1162,7 @@ class FaceRetargeter:
                 base_snake.lower() + "_r", base_snake.lower() + ".r",
             ])
             snake_base = snake[:-6] if snake.endswith("_right") else snake
-            variants.extend([
-                snake_base + "_r", snake_base + "_R",
-            ])
+            variants.extend([snake_base + "_r", snake_base + "_R"])
 
         title_snake = re.sub(r'(?<!^)(?=[A-Z])', '_', name)
         variants.append(title_snake)
@@ -1129,7 +1182,6 @@ class FaceRetargeter:
         return self._keyframed_count
 
     def print_diagnostics(self, sample_blendshapes=None):
-        """Print diagnostic info about available shape keys and matching."""
         print(f"[VMoCap] --- Face Retargeter Diagnostics ---")
         print(f"[VMoCap] Total shape keys indexed: {len(self._shapekey_mesh_map)}")
 
@@ -1147,15 +1199,12 @@ class FaceRetargeter:
                 if bs_name == "_neutral":
                     continue
                 weight = sample_blendshapes[bs_name]
-
-                # Check split first
                 split_targets = self._find_split_targets(bs_name)
                 if split_targets:
                     matched_count += 1
                     targets_str = " + ".join(split_targets)
                     print(f"[VMoCap]   {bs_name} (w={weight:.3f}) -> SPLIT: [{targets_str}]")
                     continue
-
                 match = self._find_matching_shapekey(bs_name)
                 if match:
                     matched_count += 1
@@ -1169,7 +1218,6 @@ class FaceRetargeter:
         print(f"[VMoCap] -----------------------------------------")
 
     def calibrate(self, neutral_landmarks):
-        """Calibrate neutral face from first detected frame (legacy API)."""
         if neutral_landmarks is None:
             return
         for au_name, au_config in FACE_ACTION_UNITS.items():
@@ -1187,7 +1235,6 @@ class FaceRetargeter:
         self.calibrated = True
 
     def compute_action_units(self, face_landmarks):
-        """Compute AU weights from face landmarks (legacy fallback)."""
         if face_landmarks is None:
             return {}
         au_weights = {}
@@ -1221,10 +1268,6 @@ class FaceRetargeter:
         return au_weights
 
     def apply_blendshapes_direct(self, blendshape_weights, frame, is_first_frame=False):
-        """
-        Apply ARKit blendshape weights directly to shape keys (Tasks API).
-        Handles split blendshapes (one ARKit name -> multiple shape keys).
-        """
         if not blendshape_weights:
             return
 
@@ -1237,7 +1280,6 @@ class FaceRetargeter:
             if weight < 0.005:
                 continue
 
-            # Check if this is a split blendshape first
             split_targets = self._find_split_targets(bs_name)
             if split_targets:
                 for sk_name in split_targets:
@@ -1250,9 +1292,7 @@ class FaceRetargeter:
                     self._matched_report[bs_name] = f"SPLIT: {split_targets}"
                 continue
 
-            # Standard single-target match
             matched_sk = self._find_matching_shapekey(bs_name)
-
             if matched_sk and matched_sk in self._shapekey_mesh_map:
                 for mesh_obj, kb in self._shapekey_mesh_map[matched_sk]:
                     kb.value = weight
@@ -1264,7 +1304,6 @@ class FaceRetargeter:
                 self._unmatched.add(bs_name)
 
     def apply_action_units(self, au_weights, frame):
-        """Apply computed AU weights to shape keys (legacy fallback)."""
         if not au_weights:
             return
         au_to_shapekey = {
@@ -1459,7 +1498,6 @@ class AnimationSmoother:
 
     @staticmethod
     def smooth_all_targets(armature, mesh_objects, filter_type, strength):
-        """Smooth animation on armature and all mesh shape key actions."""
         total_smoothed = 0
         if armature and armature.animation_data and armature.animation_data.action:
             count = AnimationSmoother.smooth_fcurves(
@@ -1522,6 +1560,31 @@ class VMOCAP_Properties(PropertyGroup):
             ('GUIDED', "Guided", "Manual point placement and tracking"),
         ],
         default='AUTO_BODY'
+    )
+
+    # ─── Live Preview Properties ───
+    live_camera_index: IntProperty(
+        name="Camera Device", default=0, min=0, max=10,
+        description="Webcam device index (0 = default camera)"
+    )
+    live_target_fps: IntProperty(
+        name="Target FPS", default=30, min=10, max=60,
+        description="Target frame rate for live capture"
+    )
+    live_is_active: BoolProperty(default=False)
+    live_is_recording: BoolProperty(default=False)
+    live_fps_display: FloatProperty(default=0.0)
+    live_dead_zone: FloatProperty(
+        name="Dead Zone", default=0.03, min=0.0, max=0.2,
+        description="Ignore blendshape values below this threshold (reduces jitter)"
+    )
+    live_gain: FloatProperty(
+        name="Gain", default=1.5, min=0.5, max=4.0,
+        description="Multiplier for blendshape values (compensates for subtle expressions)"
+    )
+    live_mirror: BoolProperty(
+        name="Mirror", default=True,
+        description="Mirror the camera feed (natural mirror behavior)"
     )
 
     target_armature: PointerProperty(
@@ -1592,6 +1655,35 @@ class VMOCAP_Properties(PropertyGroup):
     frame_step: IntProperty(
         name="Frame Step", default=1, min=1, max=10,
         description="Process every Nth frame (1 = every frame)"
+    )
+
+    # ─── Visibility & Depth Properties ───
+    visibility_threshold: FloatProperty(
+        name="Visibility Threshold", default=0.5, min=0.0, max=1.0,
+        description=(
+            "Minimum landmark visibility score to use a detection.\n"
+            "Higher = stricter (skips more frames for unreliable landmarks).\n"
+            "Lower = uses more data but may include bad detections"
+        )
+    )
+
+    depth_influence: FloatProperty(
+        name="Depth Influence", default=0.7, min=0.0, max=1.0,
+        description=(
+            "How much depth (Z-axis) affects bone rotations.\n"
+            "1.0 = full depth (can cause hands behind back issues).\n"
+            "0.0 = ignore depth entirely (flat 2D motion).\n"
+            "0.5-0.7 = recommended for most webcam footage"
+        )
+    )
+
+    hold_bad_frames: BoolProperty(
+        name="Hold on Low Visibility",
+        default=True,
+        description=(
+            "When a landmark drops below visibility threshold, hold the last "
+            "known good rotation instead of snapping to a bad estimate"
+        )
     )
 
     bone_mapping: CollectionProperty(type=VMOCAP_BoneMapItem)
@@ -2169,7 +2261,6 @@ class VMOCAP_OT_process_video(Operator):
         return {'FINISHED'}
 
     def _run_capture(self, context):
-        """Main capture pipeline."""
         props = context.scene.vmocap
 
         # ─── RESOLVE VIDEO PATH ───
@@ -2188,6 +2279,9 @@ class VMOCAP_OT_process_video(Operator):
 
         camera_angle_deg = math.degrees(props.camera_angle)
         print(f"[VMoCap] Camera angle: {camera_angle_deg:.1f}")
+        print(f"[VMoCap] Visibility threshold: {props.visibility_threshold:.2f}")
+        print(f"[VMoCap] Depth influence: {props.depth_influence:.2f}")
+        print(f"[VMoCap] Hold bad frames: {props.hold_bad_frames}")
 
         context.scene.render.fps = int(round(video.fps))
 
@@ -2238,7 +2332,11 @@ class VMOCAP_OT_process_video(Operator):
             armature.animation_data.action = action
             print(f"[VMoCap] Created action: '{action.name}'")
 
-            pose_retargeter = PoseRetargeter(armature, bone_map_dict, props.scale_factor)
+            pose_retargeter = PoseRetargeter(
+                armature, bone_map_dict, props.scale_factor,
+                visibility_threshold=props.visibility_threshold,
+                hold_bad_frames=props.hold_bad_frames
+            )
 
         if detect_face and mesh_objects:
             face_retargeter = FaceRetargeter(mesh_objects)
@@ -2282,9 +2380,14 @@ class VMOCAP_OT_process_video(Operator):
                 transformed = CoordinateTransformer.batch_transform(
                     results["pose"],
                     scale=props.scale_factor,
-                    camera_angle_deg=camera_angle_deg
+                    camera_angle_deg=camera_angle_deg,
+                    depth_influence=props.depth_influence
                 )
-                pose_retargeter.apply_pose_frame(transformed, blender_frame)
+                pose_retargeter.apply_pose_frame(
+                    transformed, blender_frame,
+                    visibility_array=results.get("pose_visibility"),
+                    keyframe=True
+                )
 
             # Apply face
             if face_retargeter:
@@ -2321,8 +2424,15 @@ class VMOCAP_OT_process_video(Operator):
         print(f"[VMoCap]   Frames with face: {frames_with_face}")
         print(f"[VMoCap]   Pose keyframes inserted: {pose_kf}")
         print(f"[VMoCap]   Face keyframes inserted: {face_kf}")
-        if pose_retargeter and pose_retargeter.get_warnings():
-            print(f"[VMoCap]   Warnings: {pose_retargeter.get_warnings()}")
+        if pose_retargeter:
+            if pose_retargeter.get_warnings():
+                print(f"[VMoCap]   Warnings: {pose_retargeter.get_warnings()}")
+            skip_stats = pose_retargeter.get_skip_stats()
+            if any(v > 0 for v in skip_stats.values()):
+                print(f"[VMoCap]   Visibility skips per bone:")
+                for bone, skips in sorted(skip_stats.items(), key=lambda x: -x[1]):
+                    if skips > 0:
+                        print(f"[VMoCap]     {bone}: {skips} frames held/skipped")
         print(f"[VMoCap] ========================================")
 
         # Face diagnostics
@@ -2581,6 +2691,14 @@ class VMOCAP_PT_main_panel(Panel):
         col.prop(props, "detection_confidence")
         col.prop(props, "tracking_confidence")
 
+        # ─── VISIBILITY & DEPTH ───
+        if props.mode in ('AUTO_BODY', 'AUTO_HOLISTIC'):
+            box = layout.box()
+            box.label(text="Visibility & Depth", icon='HIDE_OFF')
+            box.prop(props, "visibility_threshold")
+            box.prop(props, "depth_influence")
+            box.prop(props, "hold_bad_frames")
+
         # ─── SMOOTHING ───
         box = layout.box()
         box.label(text="Smoothing", icon='SMOOTHCURVE')
@@ -2828,6 +2946,585 @@ class VMOCAP_PT_guided_panel(Panel):
 
 
 # ═════════════════════════════════════════════════════════════════
+# SECTION 12: LIVE PREVIEW & RECORDING
+# ═════════════════════════════════════════════════════════════════
+
+# Module-level state for live preview (NOT on PropertyGroup)
+_live_session = None
+_live_face_retargeter = None
+_live_pose_retargeter = None
+
+
+class LiveCaptureSession:
+    """
+    Background capture + detection thread.
+    Produces results that the main thread can consume without blocking.
+    """
+
+    def __init__(self, device_index=0, detect_pose=False, detect_face=True,
+                 detection_confidence=0.5, tracking_confidence=0.5,
+                 target_fps=30, mirror=True):
+        self.device_index = device_index
+        self.detect_pose = detect_pose
+        self.detect_face = detect_face
+        self.det_conf = detection_confidence
+        self.track_conf = tracking_confidence
+        self.target_fps = target_fps
+        self.mirror = mirror
+
+        self._thread = None
+        self._running = False
+        self._lock = threading.Lock()
+        self._latest_result = None
+        self._latest_frame = None
+        self._fps_counter = deque(maxlen=60)
+        self._actual_fps = 0.0
+        self._frame_count = 0
+        self._error = None
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._error = None
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=3.0)
+            self._thread = None
+
+    def is_running(self):
+        return self._running
+
+    def get_error(self):
+        return self._error
+
+    def get_latest(self):
+        with self._lock:
+            return self._latest_result, self._latest_frame
+
+    def get_fps(self):
+        return self._actual_fps
+
+    def get_frame_count(self):
+        return self._frame_count
+
+    def _capture_loop(self):
+        cap = None
+        detector = None
+        try:
+            cap = cv2.VideoCapture(self.device_index)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(self.device_index, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                self._error = f"Cannot open camera device {self.device_index}"
+                self._running = False
+                return
+
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(f"[VMoCap Live] Camera opened: {actual_w}x{actual_h}")
+
+            detector = LandmarkDetector(
+                detect_pose=self.detect_pose,
+                detect_face=self.detect_face,
+                detect_hands=False,
+                min_detection_confidence=self.det_conf,
+                min_tracking_confidence=self.track_conf,
+            )
+            detector.initialize()
+            print(f"[VMoCap Live] Detector initialized")
+
+            frame_interval = 1.0 / self.target_fps
+            timestamp_ms = 0
+
+            while self._running:
+                loop_start = time.time()
+
+                ret, frame = cap.read()
+                if not ret:
+                    time.sleep(0.01)
+                    continue
+
+                if self.mirror:
+                    frame = cv2.flip(frame, 1)
+
+                timestamp_ms += int(frame_interval * 1000)
+                result = detector.process_frame(frame, timestamp_ms)
+
+                with self._lock:
+                    self._latest_result = result
+                    self._latest_frame = frame
+
+                self._frame_count += 1
+
+                now = time.time()
+                self._fps_counter.append(now)
+                if len(self._fps_counter) >= 2:
+                    elapsed = self._fps_counter[-1] - self._fps_counter[0]
+                    if elapsed > 0:
+                        self._actual_fps = (len(self._fps_counter) - 1) / elapsed
+
+                elapsed = time.time() - loop_start
+                sleep_time = frame_interval - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self._error = str(e)
+        finally:
+            if detector:
+                detector.close()
+            if cap:
+                cap.release()
+            self._running = False
+            print(f"[VMoCap Live] Capture thread stopped")
+
+
+class VMOCAP_OT_live_start(Operator):
+    """Start live preview — applies capture to rig in real-time"""
+    bl_idname = "vmocap.live_start"
+    bl_label = "Start Live Preview"
+    bl_options = {'REGISTER'}
+
+    _timer = None
+    _recording = False
+    _frame_counter = 0
+
+    @classmethod
+    def poll(cls, context):
+        global _live_session
+        props = context.scene.vmocap
+        if _live_session and _live_session.is_running():
+            return False
+        has_face_target = any(
+            mt.enabled and mt.mesh_object
+            for mt in props.mesh_targets
+        )
+        has_armature = props.target_armature is not None
+        return has_face_target or has_armature
+
+    def execute(self, context):
+        global _live_session, _live_face_retargeter, _live_pose_retargeter
+
+        props = context.scene.vmocap
+        missing = ensure_dependencies()
+        if missing:
+            self.report({'ERROR'}, f"Missing: {', '.join(missing)}")
+            return {'CANCELLED'}
+
+        # Determine what to detect
+        detect_face = props.mode in ('AUTO_FACE', 'AUTO_HOLISTIC')
+        detect_pose = props.mode in ('AUTO_BODY', 'AUTO_HOLISTIC')
+        if not detect_face and not detect_pose:
+            detect_face = True
+
+        # Start capture session
+        _live_session = LiveCaptureSession(
+            device_index=props.live_camera_index,
+            detect_pose=detect_pose,
+            detect_face=detect_face,
+            detection_confidence=props.detection_confidence,
+            tracking_confidence=props.tracking_confidence,
+            target_fps=props.live_target_fps,
+            mirror=props.live_mirror,
+        )
+        _live_session.start()
+
+        # Wait briefly for initialization
+        time.sleep(0.5)
+        if _live_session.get_error():
+            err = _live_session.get_error()
+            _live_session.stop()
+            _live_session = None
+            self.report({'ERROR'}, f"Camera error: {err}")
+            return {'CANCELLED'}
+
+        # Prepare face retargeter
+        mesh_objects = [mt.mesh_object for mt in props.mesh_targets
+                        if mt.enabled and mt.mesh_object]
+        if mesh_objects:
+            _live_face_retargeter = FaceRetargeter(mesh_objects)
+        else:
+            _live_face_retargeter = None
+
+        # Prepare pose retargeter
+        if detect_pose and props.target_armature:
+            bone_map = {}
+            for item in props.bone_mapping:
+                if item.enabled and item.bone_name and item.landmark_name:
+                    bone_map[item.landmark_name] = item.bone_name
+            _live_pose_retargeter = PoseRetargeter(
+                props.target_armature, bone_map, props.scale_factor,
+                visibility_threshold=props.visibility_threshold,
+                hold_bad_frames=props.hold_bad_frames
+            )
+        else:
+            _live_pose_retargeter = None
+
+        # Reset state
+        self._recording = False
+        self._frame_counter = 0
+        props.live_is_active = True
+        props.live_is_recording = False
+        props.live_fps_display = 0.0
+
+        # Add timer
+        interval = 1.0 / props.live_target_fps
+        self._timer = context.window_manager.event_timer_add(
+            interval, window=context.window
+        )
+        context.window_manager.modal_handler_add(self)
+
+        self.report({'INFO'}, "Live preview started! Press ESC or use Stop button.")
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        global _live_session
+
+        props = context.scene.vmocap
+
+        # ─── STOP CONDITIONS ───
+        if event.type == 'ESC' or not props.live_is_active:
+            return self._shutdown(context)
+
+        if _live_session and _live_session.get_error():
+            self.report({'ERROR'}, f"Camera error: {_live_session.get_error()}")
+            return self._shutdown(context)
+
+        if not _live_session or not _live_session.is_running():
+            return self._shutdown(context)
+
+        # ─── TIMER TICK ───
+        if event.type == 'TIMER':
+            result, frame = _live_session.get_latest()
+            if result is None:
+                return {'PASS_THROUGH'}
+
+            props.live_fps_display = _live_session.get_fps()
+            self._recording = props.live_is_recording
+
+            # Track whether we should advance frame (only once per tick)
+            should_advance_frame = False
+
+            # Apply face blendshapes
+            if result.get("face_blendshapes") and _live_face_retargeter:
+                self._apply_face_live(
+                    _live_face_retargeter, result["face_blendshapes"],
+                    context, props
+                )
+                if self._recording:
+                    should_advance_frame = True
+
+            # Apply pose
+            if result.get("pose") is not None and _live_pose_retargeter:
+                camera_angle_deg = math.degrees(props.camera_angle)
+                transformed = CoordinateTransformer.batch_transform(
+                    result["pose"],
+                    scale=props.scale_factor,
+                    camera_angle_deg=camera_angle_deg,
+                    depth_influence=props.depth_influence
+                )
+                visibility = result.get("pose_visibility")
+
+                if self._recording:
+                    frame_num = context.scene.frame_current
+                    _live_pose_retargeter.apply_pose_frame(
+                        transformed, frame_num,
+                        visibility_array=visibility,
+                        keyframe=True
+                    )
+                    should_advance_frame = True
+                else:
+                    _live_pose_retargeter.apply_pose_frame(
+                        transformed, 0,
+                        visibility_array=visibility,
+                        keyframe=False
+                    )
+
+            # Advance frame ONCE per tick if recording
+            if should_advance_frame:
+                context.scene.frame_current += 1
+
+            # Force viewport redraw
+            for area in context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+
+        return {'PASS_THROUGH'}
+
+    def _apply_face_live(self, face_retargeter, blendshape_weights, context, props):
+        if not blendshape_weights:
+            return
+
+        recording = self._recording
+        frame_num = context.scene.frame_current if recording else None
+
+        for bs_name, weight in blendshape_weights.items():
+            if bs_name == "_neutral":
+                continue
+
+            weight = self._process_weight(weight, props)
+
+            # Check split targets first
+            split_targets = face_retargeter._find_split_targets(bs_name)
+            if split_targets:
+                for sk_name in split_targets:
+                    if sk_name in face_retargeter._shapekey_mesh_map:
+                        for mesh_obj, kb in face_retargeter._shapekey_mesh_map[sk_name]:
+                            kb.value = weight
+                            if recording:
+                                kb.keyframe_insert(data_path="value", frame=frame_num)
+                continue
+
+            # Standard match
+            matched_sk = face_retargeter._find_matching_shapekey(bs_name)
+            if matched_sk and matched_sk in face_retargeter._shapekey_mesh_map:
+                for mesh_obj, kb in face_retargeter._shapekey_mesh_map[matched_sk]:
+                    kb.value = weight
+                    if recording:
+                        kb.keyframe_insert(data_path="value", frame=frame_num)
+
+    def _process_weight(self, raw_weight, props):
+        dead_zone = props.live_dead_zone
+        gain = props.live_gain
+
+        if raw_weight < dead_zone:
+            return 0.0
+
+        remapped = (raw_weight - dead_zone) / (1.0 - dead_zone)
+        result = remapped * gain
+
+        return max(0.0, min(1.0, result))
+
+    def _shutdown(self, context):
+        global _live_session, _live_face_retargeter, _live_pose_retargeter
+
+        props = context.scene.vmocap
+        props.live_is_active = False
+        props.live_is_recording = False
+
+        if self._timer:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+
+        if _live_session:
+            _live_session.stop()
+            _live_session = None
+
+        _live_face_retargeter = None
+        _live_pose_retargeter = None
+
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+        self.report({'INFO'}, "Live preview stopped.")
+        return {'CANCELLED'}
+
+
+class VMOCAP_OT_live_stop(Operator):
+    """Stop live preview"""
+    bl_idname = "vmocap.live_stop"
+    bl_label = "Stop Live Preview"
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.vmocap.live_is_active
+
+    def execute(self, context):
+        context.scene.vmocap.live_is_active = False
+        return {'FINISHED'}
+
+
+class VMOCAP_OT_live_record_toggle(Operator):
+    """Toggle recording during live preview"""
+    bl_idname = "vmocap.live_record_toggle"
+    bl_label = "Toggle Recording"
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.vmocap.live_is_active
+
+    def execute(self, context):
+        props = context.scene.vmocap
+        props.live_is_recording = not props.live_is_recording
+
+        if props.live_is_recording:
+            armature = props.target_armature
+            if armature:
+                if armature.animation_data is None:
+                    armature.animation_data_create()
+                action = bpy.data.actions.new(name="VMoCap_Live_Record")
+                armature.animation_data.action = action
+
+            mesh_objects = [mt.mesh_object for mt in props.mesh_targets
+                            if mt.enabled and mt.mesh_object]
+            for mesh_obj in mesh_objects:
+                if mesh_obj.data.shape_keys:
+                    if mesh_obj.data.shape_keys.animation_data is None:
+                        mesh_obj.data.shape_keys.animation_data_create()
+                    if not mesh_obj.data.shape_keys.animation_data.action:
+                        action = bpy.data.actions.new(
+                            name=f"VMoCap_Live_{mesh_obj.name}"
+                        )
+                        mesh_obj.data.shape_keys.animation_data.action = action
+
+            self.report({'INFO'}, "Recording started!")
+        else:
+            self.report({'INFO'}, "Recording stopped.")
+
+        return {'FINISHED'}
+
+
+class VMOCAP_OT_live_reset_pose(Operator):
+    """Reset the rig to rest pose (clear live preview transforms)"""
+    bl_idname = "vmocap.live_reset_pose"
+    bl_label = "Reset to Rest"
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.vmocap.target_armature is not None
+
+    def execute(self, context):
+        props = context.scene.vmocap
+        armature = props.target_armature
+
+        if armature:
+            for pb in armature.pose.bones:
+                pb.rotation_quaternion = Quaternion((1, 0, 0, 0))
+                pb.location = Vector((0, 0, 0))
+                pb.scale = Vector((1, 1, 1))
+
+        mesh_objects = [mt.mesh_object for mt in props.mesh_targets
+                        if mt.enabled and mt.mesh_object]
+        for mesh_obj in mesh_objects:
+            if mesh_obj.data.shape_keys:
+                for kb in mesh_obj.data.shape_keys.key_blocks:
+                    if kb.name != "Basis":
+                        kb.value = 0.0
+
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+        return {'FINISHED'}
+
+
+# ═════════════════════════════════════════════════════════════════
+# LIVE PREVIEW UI PANEL
+# ═════════════════════════════════════════════════════════════════
+
+class VMOCAP_PT_live_panel(Panel):
+    """Live Preview Panel"""
+    bl_label = "Live Preview"
+    bl_idname = "VMOCAP_PT_live_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "VMoCap"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        missing = ensure_dependencies()
+        return not missing
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.vmocap
+
+        # ─── CAMERA SETTINGS ───
+        box = layout.box()
+        box.label(text="Camera", icon='CAMERA_DATA')
+        row = box.row(align=True)
+        row.prop(props, "live_camera_index", text="Device")
+        row.prop(props, "live_target_fps", text="FPS")
+        box.prop(props, "live_mirror")
+
+        # ─── TUNING ───
+        box = layout.box()
+        box.label(text="Tuning", icon='MODIFIER')
+        box.prop(props, "live_dead_zone")
+        box.prop(props, "live_gain")
+
+        layout.separator()
+
+        # ─── START / STOP ───
+        if props.live_is_active:
+            box = layout.box()
+            row = box.row()
+            row.label(text="LIVE", icon='REC')
+            row.label(text=f"{props.live_fps_display:.1f} FPS")
+
+            if props.live_is_recording:
+                row = box.row()
+                row.alert = True
+                row.label(text="● RECORDING", icon='REC')
+                row.label(text=f"Frame: {context.scene.frame_current}")
+
+            layout.separator()
+
+            row = layout.row(align=True)
+            row.scale_y = 1.5
+            row.operator("vmocap.live_stop", text="Stop", icon='PAUSE')
+
+            row = layout.row(align=True)
+            row.scale_y = 1.3
+            if props.live_is_recording:
+                row.alert = True
+                row.operator("vmocap.live_record_toggle",
+                             text="Stop Recording", icon='SNAP_FACE')
+            else:
+                row.operator("vmocap.live_record_toggle",
+                             text="Record", icon='REC')
+
+            layout.separator()
+            layout.operator("vmocap.live_reset_pose", icon='LOOP_BACK')
+
+        else:
+            row = layout.row()
+            row.scale_y = 1.8
+            row.operator("vmocap.live_start", icon='PLAY')
+
+            layout.separator()
+            box = layout.box()
+            box.label(text="Checklist:", icon='INFO')
+
+            has_armature = props.target_armature is not None
+            has_meshes = any(mt.enabled and mt.mesh_object
+                            for mt in props.mesh_targets)
+
+            row = box.row()
+            row.label(
+                text="Armature" if has_armature else "No armature",
+                icon='CHECKMARK' if has_armature else 'BLANK1'
+            )
+            row = box.row()
+            row.label(
+                text="Mesh targets" if has_meshes else "No mesh targets",
+                icon='CHECKMARK' if has_meshes else 'BLANK1'
+            )
+
+            if props.mode in ('AUTO_BODY', 'AUTO_HOLISTIC'):
+                has_mapping = len(props.bone_mapping) > 0
+                row = box.row()
+                row.label(
+                    text="Bone mapping" if has_mapping else "No bone mapping!",
+                    icon='CHECKMARK' if has_mapping else 'ERROR'
+                )
+
+
+# ═════════════════════════════════════════════════════════════════
 # SECTION 11: REGISTRATION
 # ═════════════════════════════════════════════════════════════════
 
@@ -2857,6 +3554,11 @@ classes = [
     VMOCAP_PT_mesh_targets_panel,
     VMOCAP_PT_mapping_panel,
     VMOCAP_PT_guided_panel,
+    VMOCAP_OT_live_start,
+    VMOCAP_OT_live_stop,
+    VMOCAP_OT_live_record_toggle,
+    VMOCAP_OT_live_reset_pose,
+    VMOCAP_PT_live_panel,
 ]
 
 
@@ -2867,6 +3569,14 @@ def register():
 
 
 def unregister():
+    global _live_session, _live_face_retargeter, _live_pose_retargeter
+    # Stop any running live session
+    if _live_session and _live_session.is_running():
+        _live_session.stop()
+    _live_session = None
+    _live_face_retargeter = None
+    _live_pose_retargeter = None
+
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.vmocap
